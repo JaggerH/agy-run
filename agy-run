@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# agy-run — headless agy (Antigravity CLI) dispatch, built for orchestration from Claude Code.
+#
+# Solves, in one place:
+#   1. issue #76: `agy --print` silently drops stdout on non-TTY → wrap in `script -qec` (pseudo-TTY)
+#   2. print mode runs in agy's own scratch workspace → bind the real project dir via --add-dir
+#   3. weak models fabricate command output → discipline preamble prepended to every prompt
+#   4. usage limit on the cheap model → auto-retry once on the fallback model, loudly labeled
+#
+# Permission model (configured in ~/.gemini/antigravity-cli/settings.json):
+#   permissions.deny: command(rm), command(git push) — everything else is auto-approved in
+#   print mode. A denied command surfaces as "Permission denied for command(...)" in the reply;
+#   the caller (Claude) escalates it through its own user-facing approval.
+#
+# usage: agy-run [-C workdir] [-m model] [-f fallback_model] [-t timeout_seconds] "<prompt>"
+
+set -uo pipefail
+
+MODEL="Gemini 3.5 Flash (Low)"
+FALLBACK_MODEL="Claude Sonnet 4.6 (Thinking)"
+WORKDIR="$PWD"
+TIMEOUT=300
+
+while getopts "C:m:f:t:" opt; do
+  case "$opt" in
+    C) WORKDIR="$OPTARG" ;;
+    m) MODEL="$OPTARG" ;;
+    f) FALLBACK_MODEL="$OPTARG" ;;
+    t) TIMEOUT="$OPTARG" ;;
+    *) echo "usage: agy-run [-C workdir] [-m model] [-f fallback_model] [-t seconds] \"<prompt>\"" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+PROMPT="${1:-}"
+if [ -z "$PROMPT" ]; then
+  echo "agy-run: missing prompt" >&2
+  exit 2
+fi
+
+PREAMBLE="You are a headless worker. Work ONLY inside ${WORKDIR}. Rules:
+- When you run a shell command, paste its REAL output verbatim. NEVER invent or guess output.
+- If a command is denied by a permission rule, reply with the line: DENIED: <the exact denial message> and the exact command — do not work around the denial.
+- Be terse: return the result, not narration.
+
+Task: ${PROMPT}"
+
+CAPTURE="$(mktemp)"
+trap 'rm -f "$CAPTURE"' EXIT
+
+run_once() {
+  local model="$1" rc
+  # Args travel via env vars: `script -c` executes through /bin/sh (dash on Debian/Ubuntu),
+  # which chokes on printf-%q's $'...' quoting for multiline prompts.
+  # Output streams through to stdout in real time (tee), so callers polling a background
+  # run see progress instead of silence; a copy lands in $CAPTURE for the quota check.
+  AGY_PROMPT="$PREAMBLE" AGY_DIR="$WORKDIR" AGY_MODEL="$model" \
+    timeout "$TIMEOUT" script -qec \
+    'agy --print "$AGY_PROMPT" --add-dir "$AGY_DIR" --model "$AGY_MODEL"' \
+    /dev/null 2>&1 | tr -d '\r' | tee "$CAPTURE"
+  rc=${PIPESTATUS[0]}
+  return "$rc"
+}
+
+run_once "$MODEL"
+RC=$?
+
+if grep -qiE 'quota|rate.?limit|usage.?limit|resource.?exhausted|too many requests|429' "$CAPTURE"; then
+  echo "[agy-run] usage limit on ${MODEL} — retrying on ${FALLBACK_MODEL}" >&2
+  printf '[agy-run: answered by fallback model %s]\n' "$FALLBACK_MODEL"
+  run_once "$FALLBACK_MODEL"
+  RC=$?
+fi
+
+exit $RC
