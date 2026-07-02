@@ -65,7 +65,9 @@ run_once() {
 run_once "$MODEL"
 RC=$?
 
-if grep -qiE 'quota|rate.?limit|usage.?limit|resource.?exhausted|too many requests|429' "$CAPTURE"; then
+# Known agy limit message: "Individual quota reached. Please upgrade your subscription
+# to increase your limits. Resets in 17m4s"
+if grep -qiE 'Individual quota reached|quota (reached|exceeded)|rate.?limit(ed| exceeded)|usage.?limit|resource.?exhausted|too many requests|HTTP 429' "$CAPTURE"; then
   echo "[agy-run] usage limit on ${MODEL} — retrying on ${FALLBACK_MODEL}" >&2
   printf '[agy-run: answered by fallback model %s]\n' "$FALLBACK_MODEL"
   run_once "$FALLBACK_MODEL"
